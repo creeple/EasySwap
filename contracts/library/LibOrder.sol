@@ -33,10 +33,34 @@ library LibOrder {
         uint64 expiry;
         uint64 salt;
     }
-    struct DBOrder {
+    struct OrderInfo {
         Order order;
         OrderKey next;
     }
+    struct OrderQueue {
+        Orderkey head;
+        OrderKey tail;
+    }
+
 
     OrderKey public constant ORDERKEY_SENTINEL = OrderKey.wrap(0x0);
+
+    
+    function hash(Order memory order) internal pure returns (OrderKey) {
+        return OrderKey.wrap(
+            keccak256(
+                abi.encodePacked(
+                    order.side,
+                    order.saleKind,
+                    order.maker,
+                    order.nft.collection,
+                    order.nft.tokenId,
+                    order.nft.amount,
+                    Price.unwrap(order.price),
+                    order.expiry,
+                    order.salt
+                )
+            )
+        );
+    }
 }
