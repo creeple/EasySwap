@@ -2,7 +2,6 @@
 pragma solidity ^0.8.19;
 
 
-import "./library/LibOrder.sol";
 import {ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {LibSafeTransferUpgradeable} from "./library/LibSafeTransferUpgradeable.sol";
@@ -13,6 +12,7 @@ import "./interface/IEasySwapVault.sol";
 import {Price} from "./library/RedBlackTreeLibrary.sol";
 import {LibOrder, OrderKey} from "./library/LibOrder.sol";
 import "./OrderStorage.sol";
+import {LibPayInfo} from "./library/LibPayInfo.sol";
 
 contract EasySwapOrderBook is Initializable, ContextUpgradeable, OwnableUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable, OrderStorage, ProtocolManager, OrderValidator {
 
@@ -49,7 +49,7 @@ contract EasySwapOrderBook is Initializable, ContextUpgradeable, OwnableUpgradea
     event BatchMatchInnerError(uint256 offset, bytes msg);
     event LogSkipOrder(OrderKey orderKey, uint64 salt);
     event LogMakeOrder(OrderKey orderKey, LibOrder.Order order);
-
+    event LogCancel(OrderKey indexed orderKey, address indexed maker);
     //具体要接受nft以及eth的合约地址
     address private _vault;
 
@@ -93,6 +93,37 @@ contract EasySwapOrderBook is Initializable, ContextUpgradeable, OwnableUpgradea
         }
 
     }
+    function editOrders(LibOrder.EditDetail[] calldata editDetails) external payable whenNotPaused nonReentrant returns(OrderKey[] newOrderKeys){
+
+        newOrderKeys = new OrderKey[](editDetails.length);
+        uint256 bidETHAmount;
+        for (uint256 i = 0; i < editDetails.length; ++i) {
+            (OrderKey newOrderKey, uint256 bidPrice) = editOrderTry(
+                editDetails[i].oldOrderKey,
+                editDetails[i].newOrder
+            );
+            bidETHAmount += bidPrice;
+            newOrderKeys[i] = newOrderKey;
+        }
+
+        if (msg.value > bidETHAmount) {
+            _msgSender().safeTransferETH(msg.value - bidETHAmount);
+        }
+
+    }
+
+
+    function matchOrders(LibOrder.MatchDetail[] calldata matchDetails) external payable whenNotPaused nonReentrant{
+        uint128 buyETHAmount;
+        for(uint256 i = 0;i<matchDetails.length;++i){
+            LibOrder.MatchDetail matchDetail = matchDetails[i];
+            uint128 buyPrice = matchOrderTry(matchDetail.sellOrder,matchDetail.buyOrder);
+            buyETHAmount += buyPrice;
+        }
+        if(msg.value > buyETHAmount){
+            _msgSender().safeTransferETH(msg.value-buyETHAmount);
+        }
+    }
 
     function makeOrdersTry(LibOrder.Order orderInfo, uint128 buyPrice) internal returns (OrderKey orderKey){
         //校验条件
@@ -134,10 +165,137 @@ contract EasySwapOrderBook is Initializable, ContextUpgradeable, OwnableUpgradea
 
             cancelOrder(order);
             orderStatus[orderKey] = CANCELLED;
+            emit LogCancel(orderKey, order.maker);
+            success = true;
         } else {
             emit LogSkipOrder(orderKey, order.salt);
         }
     }
 
+    function editOrderTry(OrderKey oldOrderKey,LibOrder.Order newOrder) internal returns(OrderKey newOrderKey,uint256 bidPrice){
+
+        LibOrder.Order memory oldOrder = orders[oldOrderKey].order;
+        if (
+            (oldOrder.saleKind != newOrder.saleKind) ||
+            (oldOrder.side != newOrder.side) ||
+            (oldOrder.maker != newOrder.maker) ||
+            (oldOrder.nft.collection != newOrder.nft.collection) ||
+            (oldOrder.nft.tokenId != newOrder.nft.tokenId)
+        ) {
+            emit LogSkipOrder(oldOrderKey, oldOrder.salt);
+            return (LibOrder.ORDERKEY_SENTINEL, 0);
+        }
+        //先校验订单是否合法
+        if (
+            newOrder.maker != _msgSender() ||
+            newOrder.salt == 0 ||
+            (newOrder.expiry < block.timestamp && newOrder.expiry != 0) ||
+            orderStatus[LibOrder.hash(newOrder)] != 0 // order cannot be canceled or filled
+        ) {
+            emit LogSkipOrder(oldOrderKey, newOrder.salt);
+            return (LibOrder.ORDERKEY_SENTINEL, 0);
+        }
+        //取消旧订单
+        cancelOrder(oldOrder);
+        orderStatus[oldOrderKey] = CANCELLED;
+        emit LogCancel(oldOrderKey, oldOrder.maker);
+
+        newOrderKey = addOrder(newOrder);
+        //make order
+        if(oldOrder.side == LibOrder.Side.List){
+            IEasySwapVault(_vault).editNFT(oldOrderKey, newOrderKey);
+        }else if(oldOrder.side == LibOrder.Side.Bid){
+            uint256 oldPrice = Price.unwrap(oldOrder.price);
+            uint256 newPrice = Price.unwrap(newOrder.price);
+            if (newPrice > oldPrice) {
+                bidPrice = newPrice - oldPrice;
+                IEasySwapVault(_vault).editETH{value: uint256(bidPrice)}(
+                    oldOrderKey,
+                    newOrderKey,
+                    oldPrice,
+                    newPrice,
+                    oldOrder.maker
+                );
+            } else {
+                IEasySwapVault(_vault).editETH(
+                    oldOrderKey,
+                    newOrderKey,
+                    oldPrice,
+                    newPrice,
+                    oldOrder.maker
+                );
+            }
+        }
+        emit LogMakeOrder(newOrderKey,newOrder);
+
+    }
+
+    function matchOrderTry(LibOrder.Order sellOrder,LibOrder.Order buyOrder)internal returns(uint128 costValue){
+        OrderKey sellOrderKey = LibOrder.hash(sellOrder);
+        OrderKey buyOrderKey = LibOrder.hash(buyOrder);
+        isMatchAvailable(sellOrder, buyOrder, sellOrderKey, buyOrderKey);
+        if(_msgSender() == sellOrder.maker){
+            //require(msgValue ==0);
+            bool isSellExist = orders[sellOrderKey].order.maker != address(0);
+            if(isSellExist){
+                cancelOrder(sellOrder);
+                orderStatus[sellOrderKey] = 1;
+            }
+            uint128 fillPrice = Price.unwrap(buyOrder.price);
+            //算出手续费
+            uint128 protocolFee = _shareToAmount(fillPrice,protocolShare);
+            //先将ETH转移到本合约
+            IEasySwapVault(_vault).withdrawETH(buyOrderKey,fillPrice,address(this));
+            //在把手续费去掉后，转移给卖家
+            sellOrder.maker.safeTransferETH(fillPrice-protocolFee);
+            //将nft转移给买家
+            IEasySwapVault(_vault).withdrawNFT(sellOrderKey,buyOrder.maker,sellOrder.nft.collection,sellOrder.nft.tokenId);
+
+        }else if(_msgSender() == buyOrder.maker){
+            uint128 buyPrice = Price.unwrap(buyOrder.price);
+            uint128 fillPrice = Price.unwrap(sellOrder.price);
+            IEasySwapVault(_vault).withdrawETH(buyOrderKey,buyPrice,address(this));
+            cancelOrder(buyOrder);
+            orderStatus[buyOrder] = 1;
+            //算出手续费
+            uint128 protocolFee = _shareToAmount(fillPrice,protocolShare);
+            sellOrder.maker.safeTransferETH(fillPrice - protocolFee);
+            if(buyPrice>fillPrice){
+                buyOrder.maker.safeTransferETH(buyPrice-fillPrice);
+            }
+            IEasySwapVault(_vault).withdrawNFT(sellOrderKey,buyOrder.maker,sellOrder.nft.collection,sellOrder.nft.tokenId);
+            costValue = buyPrice;
+        }
+
+    }
+    function isMatchAvailable(LibOrder.Order memory sellOrder,LibOrder.Order memory buyOrder,OrderKey sellOrderKey,OrderKey buyOrderKey)internal view{
+        require(OrderKey.unwrap(sellOrderKey) != OrderKey.unwrap(buyOrderKey),"same order");
+        require(sellOrder.side == LibOrder.Side.List && buyOrder.side == LibOrder.Side.Bid,"side mismatch");
+        require(sellOrder.saleKind == LibOrder.SaleKind.FixedPriceForItem,"kind mismatch");
+        require(sellOrder.maker != buyOrder.maker, "HD: same maker");
+        require(buyOrder.saleKind == LibOrder.SaleKind.FixedPriceForCollection || (sellOrder.nft.collection == buyOrder.nft.collection &&
+            sellOrder.nft.tokenId == buyOrder.nft.tokenId),
+            "HD: asset mismatch"
+        );
+
+    }
+    function _shareToAmount(
+        uint128 total,
+        uint128 share
+    ) internal pure returns (uint128) {
+        return (total * share) / LibPayInfo.TOTAL_SHARE;
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    receive() external payable {}
+
+    uint256[50] private __gap;
 
 }

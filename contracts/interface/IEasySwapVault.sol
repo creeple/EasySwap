@@ -16,4 +16,8 @@ interface IEasySwapVault {
 
     function withdrawNFT(OrderKey orderKey, address to, address collection, uint256 tokenId) external;
 
+    function editETH(OrderKey oldOrderKey, OrderKey newOrderKey, uint256 oldETHAmount, uint256 newETHAmount, address to) external payable;
+
+    function editNFT(OrderKey oldOrderKey, OrderKey newOrderKey) external;
+
 }

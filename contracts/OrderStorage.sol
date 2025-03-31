@@ -33,6 +33,117 @@ contract OrderStorage is Initializable{
     //存放相同价格相同交易方向的NFT的第一笔产生的交易价格，和最新一笔的交易信息orderKey
     mapping(address => mapping(LibOrder.Side => mapping(Price => LibOrder.OrderQueue))) public priceOrders;
 
+
+    function getOrders(address collection, uint256 tokenId, LibOrder.Side side, LibOrder.SaleKind saleKind, uint256 count, Price price, OrderKey firstOrderKey) external view returns (LibOrder.Order[] memory resultOrders, OrderKey nextOrderKey)
+    {
+        resultOrders = new LibOrder.Order[](count);
+        if (RedBlackTreeLibrary.isEmpty(price)) {
+            price = getBestPrice(collection, side);
+        } else {
+            if (LibOrder.isSentinel(firstOrderKey)) {
+                price = getNextBestPrice(collection, side, price);
+            }
+        }
+        uint256 i;
+        while (RedBlackTreeLibrary.isNotEmpty(price) && i < count) {
+            LibOrder.OrderQueue memory orderQueue = priceOrders[collection][side][price];
+            OrderKey orderKey = orderQueue.head;
+            if (LibOrder.isNotSentinel(firstOrderKey)) {
+                while (LibOrder.isNotSentinel(orderKey) && OrderKey.unwrap(orderKey) != OrderKey.unwrap(firstOrderKey)) {
+                    LibOrder.OrderInfo memory order = orders[orderKey];
+                    orderKey = order.next;
+                }
+                firstOrderKey = LibOrder.ORDERKEY_SENTINEL;
+            }
+            while (LibOrder.isNotSentinel(orderKey) && i < count) {
+                LibOrder.OrderInfo memory dbOrder = orders[orderKey];
+                orderKey = dbOrder.next;
+                if ((dbOrder.order.expiry != 0 && dbOrder.order.expiry < block.timestamp)) {
+                    continue;
+                }
+                if ((side == LibOrder.Side.Bid) && (saleKind == LibOrder.SaleKind.FixedPriceForCollection)) {
+                    if ((dbOrder.order.side == LibOrder.Side.Bid) && (dbOrder.order.saleKind == LibOrder.SaleKind.FixedPriceForItem)) {
+                        continue;
+                    }
+                }
+
+                if ((side == LibOrder.Side.Bid) && (saleKind == LibOrder.SaleKind.FixedPriceForItem)) {
+                    if ((dbOrder.order.side == LibOrder.Side.Bid) && (dbOrder.order.saleKind == LibOrder.SaleKind.FixedPriceForItem) && (tokenId != dbOrder.order.nft.tokenId)) {
+                        continue;
+                    }
+                }
+                resultOrders[i] = dbOrder.order;
+                nextOrderKey = dbOrder.next;
+                i = i+1;
+            }
+            price = getNextBestPrice(collection, side, price);
+        }
+    }
+
+    function getBestOrder(
+        address collection,
+        uint256 tokenId,
+        LibOrder.Side side,
+        LibOrder.SaleKind saleKind
+    ) external view returns (LibOrder.Order memory orderResult) {
+        Price price = getBestPrice(collection, side);
+        while (RedBlackTreeLibrary.isNotEmpty(price)) {
+            LibOrder.OrderQueue memory orderQueue = priceOrders[collection][side][price];
+            OrderKey orderKey = orderQueue.head;
+            while (LibOrder.isNotSentinel(orderKey)) {
+                LibOrder.OrderInfo memory dbOrder = orders[orderKey];
+                if ((side == LibOrder.Side.Bid) && (saleKind == LibOrder.SaleKind.FixedPriceForItem)) {
+                    if ((dbOrder.order.side == LibOrder.Side.Bid) && (dbOrder.order.saleKind == LibOrder.SaleKind.FixedPriceForItem) && (tokenId != dbOrder.order.nft.tokenId)) {
+                        orderKey = dbOrder.next;
+                        continue;
+                    }
+                }
+                if ((side == LibOrder.Side.Bid) && (saleKind == LibOrder.SaleKind.FixedPriceForCollection)) {
+                    if ((dbOrder.order.side == LibOrder.Side.Bid) && (dbOrder.order.saleKind == LibOrder.SaleKind.FixedPriceForItem)) {
+                        orderKey = dbOrder.next;
+                        continue;
+                    }
+                }
+
+                if ((dbOrder.order.expiry == 0 || dbOrder.order.expiry > block.timestamp)) {
+                    orderResult = dbOrder.order;
+                    break;
+                }
+                orderKey = dbOrder.next;
+            }
+            if (Price.unwrap(orderResult.price) > 0) {
+                break;
+            }
+            price = getNextBestPrice(collection, side, price);
+        }
+    }
+    function getBestPrice(
+        address collection,
+        LibOrder.Side side
+    ) public view returns (Price price) {
+        price = (side == LibOrder.Side.Bid)
+            ? priceTrees[collection][side].last()
+            : priceTrees[collection][side].first();
+    }
+
+    function getNextBestPrice(
+        address collection,
+        LibOrder.Side side,
+        Price price
+    ) public view returns (Price nextBestPrice) {
+        if (RedBlackTreeLibrary.isEmpty(price)) {
+            nextBestPrice = (side == LibOrder.Side.Bid)
+                ? priceTrees[collection][side].last()
+                : priceTrees[collection][side].first();
+        } else {
+            nextBestPrice = (side == LibOrder.Side.Bid)
+                ? priceTrees[collection][side].prev(price)
+                : priceTrees[collection][side].next(price);
+        }
+    }
+
+
+
     function addOrder(LibOrder.Order memory order) internal{
         OrderKey orderKey = LibOrder.hash(order);
         if(orders[orderKey].order.maker != address(0)){
@@ -62,7 +173,7 @@ contract OrderStorage is Initializable{
         OrderKey prevOrderKey;
         bool found;
         while (LibOrder.isNotSentinel(orderKey) && !found) {
-            LibOrder.DBOrder memory dbOrder = orders[orderKey];
+            LibOrder.OrderInfo memory dbOrder = orders[orderKey];
             if (
                 (dbOrder.order.maker == order.maker) && (dbOrder.order.saleKind == order.saleKind) &&(dbOrder.order.expiry == order.expiry) && (dbOrder.order.salt == order.salt) && (dbOrder.order.nft.tokenId == order.nft.tokenId) && (dbOrder.order.nft.amount == order.nft.amount)
             ) {
@@ -92,7 +203,7 @@ contract OrderStorage is Initializable{
         }
         if (found) {
             if (LibOrder.isSentinel(orderQueue.head)) {
-                delete orderQueues[order.nft.collection][order.side][
+                delete priceOrders[order.nft.collection][order.side][
                 order.price
                 ];
                 RedBlackTreeLibrary.Tree storage priceTree = priceTrees[
@@ -108,4 +219,6 @@ contract OrderStorage is Initializable{
 
 
     }
+
+    uint256[50] private __gap;
 }

@@ -59,5 +59,25 @@ contract EasySwapVault is IEasySwapVault,OwnableUpgradeable {
         IERC721(collection).safeTransferNFT(address(this),to,tokenId);
         delete NFTBalance[orderKey];
     }
+    function editETH(OrderKey oldOrderKey, OrderKey newOrderKey, uint256 oldETHAmount, uint256 newETHAmount, address to) external payable onlyOrderBook {
+        ETHBalance[oldOrderKey] = 0;
+        if (oldETHAmount > newETHAmount) {
+            ETHBalance[newOrderKey] = newETHAmount;
+            to.safeTransferETH(oldETHAmount - newETHAmount);
+        } else if (oldETHAmount < newETHAmount) {
+            require(
+                msg.value >= newETHAmount - oldETHAmount,
+                "HV: not match newETHAmount"
+            );
+            ETHBalance[newOrderKey] = msg.value + oldETHAmount;
+        } else {
+            ETHBalance[newOrderKey] = oldETHAmount;
+        }
+    }
+
+    function editNFT(OrderKey oldOrderKey, OrderKey newOrderKey) external onlyOrderBook {
+        NFTBalance[newOrderKey] = NFTBalance[oldOrderKey];
+        delete NFTBalance[oldOrderKey];
+    }
 
 }

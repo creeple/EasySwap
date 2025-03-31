@@ -42,6 +42,16 @@ library LibOrder {
         OrderKey tail;
     }
 
+    struct EditDetail {
+        OrderKey oldOrderKey;
+        LibOrder.Order newOrder;
+    }
+    struct MatchDetail {
+        LibOrder.Order sellOrder;
+        LibOrder.Order buyOrder;
+    }
+
+
 
     OrderKey public constant ORDERKEY_SENTINEL = OrderKey.wrap(0x0);
 
