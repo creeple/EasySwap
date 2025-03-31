@@ -45,6 +45,13 @@ library LibOrder {
 
     OrderKey public constant ORDERKEY_SENTINEL = OrderKey.wrap(0x0);
 
+    function isSentinel(OrderKey orderKey) internal pure returns (bool) {
+        return OrderKey.unwrap(orderKey) == OrderKey.unwrap(ORDERKEY_SENTINEL);
+    }
+
+    function isNotSentinel(OrderKey orderKey) internal pure returns (bool) {
+        return OrderKey.unwrap(orderKey) != OrderKey.unwrap(ORDERKEY_SENTINEL);
+    }
     
     function hash(Order memory order) internal pure returns (OrderKey) {
         return OrderKey.wrap(
@@ -55,7 +62,6 @@ library LibOrder {
                     order.maker,
                     order.nft.collection,
                     order.nft.tokenId,
-                    order.nft.amount,
                     Price.unwrap(order.price),
                     order.expiry,
                     order.salt

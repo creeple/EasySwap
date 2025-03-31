@@ -45,7 +45,7 @@ contract EasySwapVault is IEasySwapVault,OwnableUpgradeable {
     }
 
     function withdrawETH(Orderkey orderKey,uint256 amount, address to) external onlyOrderBook{
-        require(ETHBalance >= amount,"amount not enough");
+        require(ETHBalance[orderKey] >= amount,"amount not enough");
         to.safeTransferETH(amount);
         ETHBalance[orderKey] -= amount;
     }

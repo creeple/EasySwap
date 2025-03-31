@@ -13,6 +13,7 @@ import "./interface/IEasySwapVault.sol";
 import {Price} from "./library/RedBlackTreeLibrary.sol";
 import {LibOrder, OrderKey} from "./library/LibOrder.sol";
 import "./OrderStorage.sol";
+
 contract EasySwapOrderBook is Initializable, ContextUpgradeable, OwnableUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable, OrderStorage, ProtocolManager, OrderValidator {
 
     using LibSafeTransferUpgradeable for address;
@@ -39,7 +40,7 @@ contract EasySwapOrderBook is Initializable, ContextUpgradeable, OwnableUpgradea
         __Ownable_init(_msgSender());
         __ReentrancyGuard_init();
         __Pausable_init();
-        __OrderStorage_init(EIP712Name,EIP712Version);
+        __OrderStorage_init(EIP712Name, EIP712Version);
         __ProtocolManager_init(newProtocolShare);
         setVault(newVault);
     }
@@ -47,7 +48,7 @@ contract EasySwapOrderBook is Initializable, ContextUpgradeable, OwnableUpgradea
     event LogWithdrawETH(address recipient, uint256 amount);
     event BatchMatchInnerError(uint256 offset, bytes msg);
     event LogSkipOrder(OrderKey orderKey, uint64 salt);
-    event LogMakeOrder(OrderKey orderKey,LibOrder.Order order);
+    event LogMakeOrder(OrderKey orderKey, LibOrder.Order order);
 
     //具体要接受nft以及eth的合约地址
     address private _vault;
@@ -58,54 +59,83 @@ contract EasySwapOrderBook is Initializable, ContextUpgradeable, OwnableUpgradea
     }
 
     //创建批量订单
-    function makeOrders(LibOrder.Order[] calldata newOrders) external payable whenNotPaused nonReentrant returns(OrderKey[] memory orderKeys){
+    function makeOrders(LibOrder.Order[] calldata newOrders) external payable whenNotPaused nonReentrant returns (OrderKey[] memory orderKeys){
         uint256 orderAmount = newOrders.length;
         orderKeys = new OrderKey[](orderAmount);
         //定义ETHAmount，如果是买bid 行为，记录需要多少ETH,计算用户eth是否充足
         uint128 ETHAmount;
-        for(uint256 i = 0;i<orderAmount;++i){
-            uint128 buyPrice;
-            if(newOrders[i].side == LibOrder.Side.Bid){
-                buyPrice = Price.unwrap(newOrders[i].price) * newOrders[i].nft.amount;
-            }
-            OrderKey orderKey = makeOrdersTry(newOrders[i],buyPrice);
+        for (uint256 i = 0; i < orderAmount;) {
+            uint128 buyPrice = Price.unwrap(newOrders[i].price);
+            OrderKey orderKey = makeOrdersTry(newOrders[i], buyPrice);
             orderKeys[i] = orderKey;
             //判断订单是否创建成功，如果订单创建成功，则累加ETHAmount
-            if(orderKey!= LibOrder.ORDERKEY_SENTINEL()){
+            if (orderKey != LibOrder.ORDERKEY_SENTINEL()) {
                 ETHAmount += buyPrice;
+            }
+            unchecked{
+                ++i;
             }
         }
         //判断用户余额是否够用
-        if(msg.value > ETHAmount){
+        if (msg.value > ETHAmount) {
             _msgSender().safeTransferETH(msg.value - ETHAmount);
         }
 
     }
 
-    function makeOrdersTry(LibOrder.Order orderInfo,uint128 buyPrice) internal returns(OrderKey orderKey){
+    function cancelOrders(OrderKey[] calldata orderKeys) external whenNotPaused nonReentrant returns (bool[] memory successOrder){
+        successOrder = new bool[](orderKeys.length);
+        for (uint256 i = 0; i < orderKeys.length;) {
+            successOrder[i] = cancelOrderTry(orderKeys[i]);
+            unchecked{
+                ++i;
+            }
+        }
+
+    }
+
+    function makeOrdersTry(LibOrder.Order orderInfo, uint128 buyPrice) internal returns (OrderKey orderKey){
         //校验条件
-        if(
-            orderInfo.maker != _msgSender() && Price.unwrap(orderInfo.price) !=0 &&
-            orderInfo.salt !=0 && (orderInfo.expiry > block.timestamp || orderInfo.expiry == 0) &&
+        if (
+            orderInfo.maker != _msgSender() && Price.unwrap(orderInfo.price) != 0 &&
+            orderInfo.salt != 0 && (orderInfo.expiry > block.timestamp || orderInfo.expiry == 0) &&
             orderStatus[LibOrder.hash(orderInfo)] == 0
-        ){
+        ) {
             orderKey = LibOrder.hash(orderInfo);
-            if(orderInfo.side == LibOrder.Side.List){
+            if (orderInfo.side == LibOrder.Side.List) {
                 //卖单操作
                 //订单创建时，将nft转入资金池
-                IEasySwapVault(_vault).depositNFT(orderKey,orderInfo.maker,orderInfo.nft.collection,orderInfo.nft.tokenId);
-            }else if(orderInfo.side == LibOrder.Side.Bid){
+                IEasySwapVault(_vault).depositNFT(orderKey, orderInfo.maker, orderInfo.nft.collection, orderInfo.nft.tokenId);
+            } else if (orderInfo.side == LibOrder.Side.Bid) {
                 //买单操作
-                IEasySwapVault(_vault).depositETH(){value: uint256(buyPrice)}(orderKey,buyPrice);
+                IEasySwapVault(_vault).depositETH(){value: uint256(buyPrice)}(orderKey, buyPrice);
             }
             //订单信息存储到OrderStorage合约
             addOrder(orderInfo);
 
             emit LogMakeOrder(orderKey, orderInfo);
 
-        }else{
+        } else {
             //跳过订单
-            emit LogSkipOrder(LibOrder.hash(orderInfo),orderInfo.salt);
+            emit LogSkipOrder(LibOrder.hash(orderInfo), orderInfo.salt);
+        }
+
+    }
+
+    function cancelOrderTry(OrderKey orderKey) internal returns (bool success){
+        LibOrder.Order order = orders[orderKey].order;
+        //首先判断取消的订单请求发起者是否为订单创建者，只有订单创建者才可以取消订单
+        if (order.maker == _msgSender() && orderStatus[orderKey] == 0) {
+            if (order.side == LibOrder.Side.List) {
+                IEasySwapVault(_vault).withdrawNFT(orderKey, order.maker, order.nft.collection, order.nft.tokenId);
+            } else if (order.side == LibOrder.Side.Bid) {
+                IEasySwapVault(_vault).withdrawETH(orderKey, Price.unwrap(order.price));
+            }
+
+            cancelOrder(order);
+            orderStatus[orderKey] = CANCELLED;
+        } else {
+            emit LogSkipOrder(orderKey, order.salt);
         }
     }
 
